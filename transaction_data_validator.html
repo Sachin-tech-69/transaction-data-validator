@@ -1,0 +1,436 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font-sans,system-ui,sans-serif);background:transparent;color:var(--color-text-primary,#111)}
+button{font-family:inherit;cursor:pointer}
+input[type=file]{display:none}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--color-border-secondary,#ccc);border-radius:4px}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+.fade-in{animation:fadeIn 0.3s ease}
+.spin{animation:spin 1s linear infinite}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const {useState,useRef,useCallback,useEffect}=React;
+
+const COUNTRY_PHONE_RULES={
+  SG:{digits:8,label:"Singapore"},IN:{digits:10,label:"India"},
+  US:{digits:10,label:"United States"},GB:{digits:10,label:"United Kingdom"},
+  AU:{digits:9,label:"Australia"},MY:{digits:10,label:"Malaysia"},
+  PH:{digits:10,label:"Philippines"},ID:{digits:12,label:"Indonesia"},
+};
+
+const DATE_FORMATS=[
+  /^\d{4}-\d{2}-\d{2}$/,/^\d{2}\/\d{2}\/\d{4}$/,
+  /^\d{2}-\d{2}-\d{4}$/,/^\d{4}\/\d{2}\/\d{2}$/
+];
+
+const PAYMENT_MODES=["CREDIT_CARD","DEBIT_CARD","NET_BANKING","UPI","CASH","WALLET","BANK_TRANSFER","CHEQUE"];
+const CHUNK_SIZE=100;
+
+const SAMPLE_CSV=`order_id,product_name,quantity,amount,payment_mode,phone,country,order_date
+ORD001,Laptop Pro,1,1299.99,CREDIT_CARD,98765432,SG,2024-01-15
+ORD002,Wireless Mouse,2,45.50,UPI,9876543210,IN,15/01/2024
+ORD003,USB Hub,3,29.99,DEBIT_CARD,+1-555-123-4567,US,2024-01-16
+ORD004,Monitor 4K,1,599.00,NET_BANKING,12345,SG,2024-01-16
+ORD005,Keyboard,2,89.00,CASH,87654321,SG,invalid-date
+ORD006,Webcam,1,79.99,PAYPAL,9988776655,IN,2024-01-17
+ORD007,Headphones,1,199.00,WALLET,6512345678,SG,2024-01-17
+ORD008,,0,-15.00,BANK_TRANSFER,8765432109,IN,2024-01-18
+ORD009,Charger,1,35.00,CREDIT_CARD,87654321,SG,2024-01-19
+ORD010,Speaker,2,299.00,UPI,9123456789,IN,2024-01-19`;
+
+function parseCSV(text){
+  const lines=text.trim().split("\n");
+  if(lines.length<2)return{headers:[],rows:[]};
+  const headers=lines[0].split(",").map(h=>h.trim().replace(/^"|"$/g,""));
+  const rows=lines.slice(1).map(line=>{
+    const vals=[];let cur="",inQ=false;
+    for(let i=0;i<line.length;i++){
+      if(line[i]==='"')inQ=!inQ;
+      else if(line[i]===','&&!inQ){vals.push(cur.trim());cur="";}
+      else cur+=line[i];
+    }
+    vals.push(cur.trim());
+    const obj={};
+    headers.forEach((h,i)=>obj[h]=(vals[i]||"").replace(/^"|"$/g,""));
+    return obj;
+  });
+  return{headers,rows};
+}
+
+function validatePhone(phone,country){
+  if(!phone)return{valid:false,error:"Phone number missing"};
+  const clean=phone.replace(/[\s\-\+\(\)]/g,"");
+  const rule=COUNTRY_PHONE_RULES[country?.toUpperCase()];
+  if(!rule)return{valid:true,error:null};
+  if(clean.length!==rule.digits&&!(clean.length===rule.digits+country.length))
+    return{valid:false,error:`Expected ${rule.digits} digits for ${rule.label}, got ${Math.min(clean.length,15)}`};
+  return{valid:true,error:null};
+}
+
+function validateDate(d){
+  if(!d)return{valid:false,error:"Date missing"};
+  if(!DATE_FORMATS.some(r=>r.test(d)))return{valid:false,error:`Unrecognized format: "${d}"`};
+  return{valid:true,error:null};
+}
+
+function validatePayment(m){
+  if(!m)return{valid:false,error:"Payment mode missing"};
+  if(!PAYMENT_MODES.includes(m.toUpperCase()))return{valid:false,error:`Unknown mode: "${m}"`};
+  return{valid:true,error:null};
+}
+
+function validateAmount(a){
+  if(!a)return{valid:false,error:"Amount missing"};
+  const n=parseFloat(a);
+  if(isNaN(n))return{valid:false,error:"Not a number"};
+  if(n<0)return{valid:false,error:"Negative amount"};
+  return{valid:true,error:null};
+}
+
+function detectCols(headers){
+  const lc=h=>h.toLowerCase();
+  return{
+    phone:headers.find(h=>["phone","mobile","contact","phone_number","mobile_number"].includes(lc(h))),
+    country:headers.find(h=>["country","country_code","nation"].includes(lc(h))),
+    date:headers.find(h=>["date","order_date","transaction_date","created_at","timestamp"].includes(lc(h))),
+    payment:headers.find(h=>["payment_mode","payment","payment_method","mode"].includes(lc(h))),
+    amount:headers.find(h=>["amount","total","price","value","order_total"].includes(lc(h))),
+    orderId:headers.find(h=>["order_id","orderid","id","transaction_id"].includes(lc(h))),
+    product:headers.find(h=>["product","product_name","item","sku"].includes(lc(h))),
+    quantity:headers.find(h=>["quantity","qty","units"].includes(lc(h))),
+  };
+}
+
+function validateRow(row,cols,rowIndex){
+  const errors=[],warnings=[];
+  if(cols.orderId&&!row[cols.orderId])errors.push({field:cols.orderId,msg:"Order ID missing"});
+  if(cols.phone){
+    const country=cols.country?row[cols.country]:"US";
+    const r=validatePhone(row[cols.phone],country);
+    if(!r.valid)errors.push({field:cols.phone,msg:r.error});
+  }
+  if(cols.date){const r=validateDate(row[cols.date]);if(!r.valid)errors.push({field:cols.date,msg:r.error});}
+  if(cols.payment){const r=validatePayment(row[cols.payment]);if(!r.valid)errors.push({field:cols.payment,msg:r.error});}
+  if(cols.amount){const r=validateAmount(row[cols.amount]);if(!r.valid)errors.push({field:cols.amount,msg:r.error});}
+  if(cols.quantity){const q=parseInt(row[cols.quantity]);if(isNaN(q)||q<=0)warnings.push({field:cols.quantity,msg:"Should be positive integer"});}
+  if(cols.product&&!row[cols.product])warnings.push({field:cols.product,msg:"Product name empty"});
+  return{rowIndex,errors,warnings,isValid:errors.length===0};
+}
+
+function rowToCSV(row,headers){
+  return headers.map(h=>{const v=row[h]??"";return v.includes(",")?`"${v}"`:v;}).join(",");
+}
+
+function dlCSV(content,name){
+  const b=new Blob([content],{type:"text/csv"});
+  const u=URL.createObjectURL(b);
+  const a=document.createElement("a");a.href=u;a.download=name;a.click();URL.revokeObjectURL(u);
+}
+
+const purple="#534AB7",purpleLight="#EEEDFE",purpleMid="#AFA9EC",purpleDark="#26215C";
+
+function App(){
+  const[stage,setStage]=useState("upload");
+  const[fileName,setFileName]=useState("");
+  const[parsed,setParsed]=useState(null);
+  const[results,setResults]=useState(null);
+  const[processing,setProcessing]=useState(false);
+  const[aiText,setAiText]=useState("");
+  const[aiLoading,setAiLoading]=useState(false);
+  const[tab,setTab]=useState("summary");
+  const[filter,setFilter]=useState("all");
+  const fileRef=useRef();
+
+  const handleFile=useCallback(file=>{
+    if(!file)return;
+    setFileName(file.name);
+    const r=new FileReader();
+    r.onload=e=>{const d=parseCSV(e.target.result);setParsed(d);setStage("preview");};
+    r.readAsText(file);
+  },[]);
+
+  const handleDrop=useCallback(e=>{
+    e.preventDefault();
+    const f=e.dataTransfer.files[0];
+    if(f&&f.name.endsWith(".csv"))handleFile(f);
+  },[handleFile]);
+
+  const loadSample=()=>{
+    setFileName("sample_transactions.csv");
+    setParsed(parseCSV(SAMPLE_CSV));
+    setStage("preview");
+  };
+
+  const runValidation=async()=>{
+    setProcessing(true);
+    await new Promise(r=>setTimeout(r,500));
+    const cols=detectCols(parsed.headers);
+    const validRows=[],invalidRows=[],allResults=[];
+    parsed.rows.forEach((row,i)=>{
+      const res=validateRow(row,cols,i+2);
+      allResults.push(res);
+      if(res.isValid)validRows.push(row);
+      else invalidRows.push({...row,__errors:res.errors.map(e=>e.msg).join("; ")});
+    });
+    const stats={total:parsed.rows.length,valid:validRows.length,invalid:invalidRows.length,warnings:allResults.reduce((s,r)=>s+r.warnings.length,0)};
+    const chunks=[];
+    for(let i=0;i<validRows.length;i+=CHUNK_SIZE)chunks.push(validRows.slice(i,i+CHUNK_SIZE));
+    setResults({allResults,validRows,invalidRows,stats,cols,chunks});
+    setProcessing(false);
+    setStage("results");
+    fetchAI(stats,allResults,cols);
+  };
+
+  const fetchAI=async(stats,allResults,cols)=>{
+    setAiLoading(true);
+    const errs=allResults.filter(r=>!r.isValid).slice(0,5).map(r=>`Row ${r.rowIndex}: ${r.errors.map(e=>`${e.field} — ${e.msg}`).join(", ")}`).join("\n");
+    try{
+      const res=await fetch("https://api.anthropic.com/v1/messages",{
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          model:"claude-sonnet-4-6",max_tokens:1000,
+          messages:[{role:"user",content:`You are a data quality analyst. Analyze this transaction dataset validation result and write a concise 3-sentence plain-prose summary.
+
+Stats: ${stats.total} total rows, ${stats.valid} valid (${Math.round(stats.valid/stats.total*100)}%), ${stats.invalid} invalid, ${stats.warnings} warnings.
+Detected fields: ${Object.entries(cols).filter(([,v])=>v).map(([k,v])=>`${k}→${v}`).join(", ")}.
+Sample errors:\n${errs||"None"}
+
+Cover: (1) overall data quality rating (excellent/good/fair/poor), (2) the dominant error type, (3) a specific fix recommendation. No bullet points.`}]
+        })
+      });
+      const d=await res.json();
+      setAiText(d.content?.[0]?.text||"Analysis unavailable.");
+    }catch{setAiText("AI analysis unavailable. Review the row-level results below.");}
+    setAiLoading(false);
+  };
+
+  const pct=results?Math.round(results.stats.valid/results.stats.total*100):0;
+  const scoreColor=pct>=90?"#16a34a":pct>=70?"#d97706":"#dc2626";
+
+  const filteredRes=results?.allResults.filter(r=>filter==="valid"?r.isValid:filter==="invalid"?!r.isValid:true)||[];
+
+  const stages=["upload","preview","results"];
+  const stageIdx=stages.indexOf(stage);
+
+  return React.createElement("div",{style:{maxWidth:820,margin:"0 auto",padding:"1.5rem 1rem",fontFamily:"var(--font-sans,system-ui)"}},
+    React.createElement("h2",{style:{fontSize:22,fontWeight:500,color:"var(--color-text-primary,#111)",margin:"0 0 4px"}},"Transaction Data Validator"),
+    React.createElement("p",{style:{fontSize:14,color:"var(--color-text-secondary,#666)",margin:"0 0 1.5rem"}},"Validate order, product, and payment data from CSV files"),
+
+    // Progress
+    React.createElement("div",{style:{display:"flex",alignItems:"center",marginBottom:"1.5rem"}},
+      ["Upload","Preview","Results"].map((s,i)=>
+        React.createElement("div",{key:s,style:{flex:1,display:"flex",alignItems:"center"}},
+          i>0&&React.createElement("div",{style:{flex:1,height:2,background:i<=stageIdx?purple:"var(--color-border-tertiary,#e5e7eb)"}}),
+          React.createElement("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",padding:"0 4px"}},
+            React.createElement("div",{style:{width:28,height:28,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:500,background:i<stageIdx?purple:i===stageIdx?purpleLight:"var(--color-background-secondary,#f9fafb)",color:i<stageIdx?"#fff":i===stageIdx?purple:"var(--color-text-tertiary,#9ca3af)",border:i===stageIdx?`1.5px solid ${purple}`:"none"}},
+              i<stageIdx?React.createElement("i",{className:"ti ti-check",style:{fontSize:13}}):(i+1)
+            ),
+            React.createElement("span",{style:{fontSize:11,marginTop:3,color:i===stageIdx?purple:"var(--color-text-tertiary,#9ca3af)"}},s)
+          ),
+          i<2&&React.createElement("div",{style:{flex:1,height:2,background:i<stageIdx?purple:"var(--color-border-tertiary,#e5e7eb)"}})
+        )
+      )
+    ),
+
+    // Upload Stage
+    stage==="upload"&&React.createElement("div",{className:"fade-in"},
+      React.createElement("div",{
+        onDrop:handleDrop,onDragOver:e=>e.preventDefault(),
+        onClick:()=>fileRef.current.click(),
+        style:{border:`1.5px dashed ${purpleMid}`,borderRadius:12,padding:"3rem 2rem",textAlign:"center",cursor:"pointer",background:purpleLight}
+      },
+        React.createElement("i",{className:"ti ti-cloud-upload",style:{fontSize:36,color:purple,display:"block",marginBottom:12},["aria-hidden"]:"true"}),
+        React.createElement("p",{style:{fontWeight:500,fontSize:15,color:"var(--color-text-primary,#111)",marginBottom:4}},"Drop your CSV file here"),
+        React.createElement("p",{style:{fontSize:13,color:"var(--color-text-secondary,#666)"}},"or click to browse — CSV files only"),
+        React.createElement("input",{ref:fileRef,type:"file",accept:".csv",onChange:e=>handleFile(e.target.files[0])})
+      ),
+      React.createElement("div",{style:{textAlign:"center",margin:"1rem 0",fontSize:13,color:"var(--color-text-tertiary,#9ca3af)"}},"or"),
+      React.createElement("button",{onClick:loadSample,style:{width:"100%",padding:"10px",borderRadius:8,border:"0.5px solid var(--color-border-secondary,#d1d5db)",background:"var(--color-background-primary,#fff)",fontSize:14,color:"var(--color-text-primary,#111)",display:"flex",alignItems:"center",justifyContent:"center",gap:8}},
+        React.createElement("i",{className:"ti ti-file-spreadsheet",["aria-hidden"]:"true"}),
+        "Load sample dataset (10 rows with mixed valid/invalid)"
+      ),
+      React.createElement("div",{style:{marginTop:"1.25rem",padding:"14px 16px",background:"var(--color-background-secondary,#f9fafb)",borderRadius:8,border:"0.5px solid var(--color-border-tertiary,#e5e7eb)"}},
+        React.createElement("p",{style:{fontSize:13,fontWeight:500,marginBottom:10,color:"var(--color-text-primary,#111)"}},"Supported columns"),
+        React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:"6px 16px"}},
+          [["order_id","Unique order identifier"],["product_name","Product or item name"],["quantity","Units ordered"],["amount","Transaction total"],["payment_mode","CREDIT_CARD, UPI, CASH…"],["phone","Customer phone"],["country","ISO code: SG, IN, US…"],["order_date","YYYY-MM-DD or DD/MM/YYYY"]].map(([f,d])=>
+            React.createElement("div",{key:f,style:{display:"flex",alignItems:"baseline",gap:6}},
+              React.createElement("code",{style:{fontSize:11,color:purple,background:purpleLight,padding:"1px 5px",borderRadius:3}}),
+              React.createElement("span",{style:{fontSize:11,fontFamily:"var(--font-mono,monospace)",color:purple}},f),
+              React.createElement("span",{style:{fontSize:11,color:"var(--color-text-tertiary,#9ca3af)"}}," — "+d)
+            )
+          )
+        )
+      )
+    ),
+
+    // Preview Stage
+    stage==="preview"&&parsed&&React.createElement("div",{className:"fade-in"},
+      React.createElement("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:"1rem",padding:"10px 14px",background:"var(--color-background-secondary,#f9fafb)",borderRadius:8,border:"0.5px solid var(--color-border-tertiary,#e5e7eb)"}},
+        React.createElement("i",{className:"ti ti-file-text",style:{color:purple,fontSize:20},["aria-hidden"]:"true"}),
+        React.createElement("div",{style:{flex:1}},
+          React.createElement("p",{style:{margin:0,fontWeight:500,fontSize:14,color:"var(--color-text-primary,#111)"}},fileName),
+          React.createElement("p",{style:{margin:0,fontSize:12,color:"var(--color-text-secondary,#666)"}},`${parsed.rows.length} rows · ${parsed.headers.length} columns`)
+        ),
+        React.createElement("button",{onClick:()=>setStage("upload"),style:{fontSize:12,color:"var(--color-text-secondary,#666)",background:"none",border:"none",cursor:"pointer"}},"Change file")
+      ),
+      React.createElement("div",{style:{overflowX:"auto",border:"0.5px solid var(--color-border-tertiary,#e5e7eb)",borderRadius:8,marginBottom:"1rem"}},
+        React.createElement("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12}},
+          React.createElement("thead",null,
+            React.createElement("tr",{style:{background:"var(--color-background-secondary,#f9fafb)"}},
+              React.createElement("th",{style:{padding:"8px 10px",textAlign:"left",borderBottom:"0.5px solid var(--color-border-tertiary,#e5e7eb)",color:"var(--color-text-secondary,#666)",fontWeight:500}},"#"),
+              parsed.headers.map(h=>React.createElement("th",{key:h,style:{padding:"8px 10px",textAlign:"left",borderBottom:"0.5px solid var(--color-border-tertiary,#e5e7eb)",color:"var(--color-text-secondary,#666)",fontWeight:500,whiteSpace:"nowrap"}},h))
+            )
+          ),
+          React.createElement("tbody",null,
+            parsed.rows.slice(0,6).map((row,i)=>
+              React.createElement("tr",{key:i,style:{borderBottom:"0.5px solid var(--color-border-tertiary,#e5e7eb)"}},
+                React.createElement("td",{style:{padding:"7px 10px",color:"var(--color-text-tertiary,#9ca3af)"}},i+2),
+                parsed.headers.map(h=>React.createElement("td",{key:h,style:{padding:"7px 10px",whiteSpace:"nowrap",maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",color:row[h]?"var(--color-text-primary,#111)":"var(--color-text-tertiary,#9ca3af)"}},row[h]||"—"))
+              )
+            )
+          )
+        ),
+        parsed.rows.length>6&&React.createElement("p",{style:{fontSize:12,color:"var(--color-text-tertiary,#9ca3af)",padding:"6px 10px",margin:0}},`…and ${parsed.rows.length-6} more rows`)
+      ),
+      React.createElement("button",{onClick:runValidation,disabled:processing,style:{width:"100%",padding:"11px",borderRadius:8,border:"none",background:purple,color:"#fff",fontWeight:500,fontSize:14,cursor:processing?"wait":"pointer",opacity:processing?0.75:1,display:"flex",alignItems:"center",justifyContent:"center",gap:8}},
+        processing?[
+          React.createElement("i",{key:1,className:"ti ti-loader-2 spin"}),
+          "Validating…"
+        ]:[
+          React.createElement("i",{key:1,className:"ti ti-shield-check"}),
+          "Run Validation"
+        ]
+      )
+    ),
+
+    // Results Stage
+    stage==="results"&&results&&React.createElement("div",{className:"fade-in"},
+      // Stats
+      React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:"1.25rem"}},
+        [{label:"Total rows",val:results.stats.total,icon:"ti-table",col:null},
+         {label:"Valid",val:results.stats.valid,icon:"ti-circle-check",col:"#16a34a"},
+         {label:"Invalid",val:results.stats.invalid,icon:"ti-circle-x",col:"#dc2626"},
+         {label:"Quality",val:pct+"%",icon:"ti-chart-pie",col:scoreColor}
+        ].map(({label,val,icon,col})=>
+          React.createElement("div",{key:label,style:{background:"var(--color-background-secondary,#f9fafb)",borderRadius:8,padding:"12px 14px"}},
+            React.createElement("div",{style:{display:"flex",alignItems:"center",gap:6,marginBottom:4}},
+              React.createElement("i",{className:`ti ${icon}`,style:{fontSize:13,color:col||"var(--color-text-secondary,#666)"},["aria-hidden"]:"true"}),
+              React.createElement("span",{style:{fontSize:11,color:"var(--color-text-secondary,#666)"}},label)
+            ),
+            React.createElement("p",{style:{margin:0,fontSize:22,fontWeight:500,color:col||"var(--color-text-primary,#111)"}},val)
+          )
+        )
+      ),
+
+      // AI Summary
+      React.createElement("div",{style:{marginBottom:"1.25rem",padding:"14px 16px",background:purpleLight,borderRadius:8,border:`0.5px solid ${purpleMid}`}},
+        React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:6}},
+          React.createElement("i",{className:"ti ti-sparkles",style:{color:purple,fontSize:14},["aria-hidden"]:"true"}),
+          React.createElement("span",{style:{fontSize:13,fontWeight:500,color:purpleDark}},"AI Analysis")
+        ),
+        aiLoading
+          ?React.createElement("p",{style:{margin:0,fontSize:13,color:purple}},"Analyzing dataset…")
+          :React.createElement("p",{style:{margin:0,fontSize:13,lineHeight:1.65,color:purpleDark}},aiText)
+      ),
+
+      // Tabs
+      React.createElement("div",{style:{display:"flex",gap:2,borderBottom:"0.5px solid var(--color-border-tertiary,#e5e7eb)",marginBottom:"1rem"}},
+        [["summary","Row details"],["downloads","Downloads"]].map(([id,lbl])=>
+          React.createElement("button",{key:id,onClick:()=>setTab(id),style:{padding:"8px 14px",fontSize:13,fontWeight:tab===id?500:400,color:tab===id?purple:"var(--color-text-secondary,#666)",background:"none",border:"none",borderBottom:tab===id?`2px solid ${purple}`:"2px solid transparent",cursor:"pointer",marginBottom:-1}},lbl)
+        )
+      ),
+
+      // Summary tab
+      tab==="summary"&&React.createElement("div",null,
+        React.createElement("div",{style:{display:"flex",gap:6,marginBottom:"0.75rem"}},
+          ["all","valid","invalid"].map(m=>
+            React.createElement("button",{key:m,onClick:()=>setFilter(m),style:{padding:"5px 12px",fontSize:12,borderRadius:20,border:"0.5px solid var(--color-border-secondary,#d1d5db)",background:filter===m?purple:"var(--color-background-primary,#fff)",color:filter===m?"#fff":"var(--color-text-secondary,#666)",cursor:"pointer"}},
+              `${m.charAt(0).toUpperCase()+m.slice(1)} (${m==="all"?results.stats.total:m==="valid"?results.stats.valid:results.stats.invalid})`
+            )
+          )
+        ),
+        React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:6,maxHeight:360,overflowY:"auto"}},
+          filteredRes.map(r=>
+            React.createElement("div",{key:r.rowIndex,style:{padding:"10px 12px",borderRadius:8,border:`0.5px solid ${r.isValid?"#bbf7d0":"#fca5a5"}`,background:r.isValid?"#f0fdf4":"#fff5f5",display:"flex",alignItems:"flex-start",gap:10}},
+              React.createElement("i",{className:`ti ${r.isValid?"ti-circle-check":"ti-circle-x"}`,style:{fontSize:15,color:r.isValid?"#16a34a":"#dc2626",marginTop:1,flexShrink:0},["aria-hidden"]:"true"}),
+              React.createElement("div",{style:{flex:1}},
+                React.createElement("p",{style:{margin:"0 0 2px",fontSize:13,fontWeight:500,color:"var(--color-text-primary,#111)"}},`Row ${r.rowIndex}`),
+                r.errors.map((e,i)=>React.createElement("p",{key:i,style:{margin:"1px 0",fontSize:12,color:"#991b1b"}},
+                  React.createElement("code",{style:{fontSize:11}},e.field),": ",e.msg
+                )),
+                r.warnings.map((w,i)=>React.createElement("p",{key:i,style:{margin:"1px 0",fontSize:12,color:"#92400e"}},
+                  React.createElement("i",{className:"ti ti-alert-triangle",style:{fontSize:11}}," "),
+                  React.createElement("code",{style:{fontSize:11}},w.field),": ",w.msg
+                )),
+                r.isValid&&r.warnings.length===0&&React.createElement("p",{style:{margin:0,fontSize:12,color:"#15803d"}},"All checks passed")
+              )
+            )
+          )
+        )
+      ),
+
+      // Downloads tab
+      tab==="downloads"&&React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:10}},
+        results.chunks.length>0&&React.createElement("div",{style:{padding:"14px 16px",borderRadius:8,border:"0.5px solid var(--color-border-tertiary,#e5e7eb)",background:"var(--color-background-primary,#fff)"}},
+          React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:6}},
+            React.createElement("i",{className:"ti ti-circle-check",style:{color:"#16a34a",fontSize:16},["aria-hidden"]:"true"}),
+            React.createElement("p",{style:{margin:0,fontWeight:500,fontSize:14,color:"var(--color-text-primary,#111)"}},`Validated data — ${results.stats.valid} rows`)
+          ),
+          React.createElement("p",{style:{margin:"0 0 10px",fontSize:12,color:"var(--color-text-secondary,#666)"}},`Split into ${results.chunks.length} chunk${results.chunks.length>1?"s":""} of up to ${CHUNK_SIZE} rows each`),
+          React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:8}},
+            results.chunks.map((chunk,idx)=>
+              React.createElement("button",{key:idx,onClick:()=>{
+                const h=parsed.headers.join(",");
+                const rows=chunk.map(r=>rowToCSV(r,parsed.headers)).join("\n");
+                dlCSV(`${h}\n${rows}`,`validated_chunk_${idx+1}.csv`);
+              },style:{padding:"7px 14px",fontSize:12,borderRadius:8,border:"0.5px solid var(--color-border-secondary,#d1d5db)",background:"var(--color-background-secondary,#f9fafb)",cursor:"pointer",display:"flex",alignItems:"center",gap:6,color:"var(--color-text-primary,#111)"}},
+                React.createElement("i",{className:"ti ti-download",style:{fontSize:13},["aria-hidden"]:"true"}),
+                `Chunk ${idx+1} (${chunk.length} rows)`
+              )
+            )
+          )
+        ),
+
+        results.invalidRows.length>0&&React.createElement("div",{style:{padding:"14px 16px",borderRadius:8,border:"0.5px solid var(--color-border-tertiary,#e5e7eb)",background:"var(--color-background-primary,#fff)"}},
+          React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:6}},
+            React.createElement("i",{className:"ti ti-circle-x",style:{color:"#dc2626",fontSize:16},["aria-hidden"]:"true"}),
+            React.createElement("p",{style:{margin:0,fontWeight:500,fontSize:14,color:"var(--color-text-primary,#111)"}},`Invalid rows — ${results.stats.invalid} rows`)
+          ),
+          React.createElement("p",{style:{margin:"0 0 10px",fontSize:12,color:"var(--color-text-secondary,#666)"}},"Includes an ",React.createElement("code",{style:{fontSize:11}},"__errors")," column explaining each failure"),
+          React.createElement("button",{onClick:()=>{
+            const h=[...parsed.headers,"__errors"].join(",");
+            const rows=results.invalidRows.map(r=>rowToCSV(r,[...parsed.headers,"__errors"])).join("\n");
+            dlCSV(`${h}\n${rows}`,"invalid_rows.csv");
+          },style:{padding:"7px 14px",fontSize:12,borderRadius:8,border:"0.5px solid #fca5a5",background:"#fff5f5",cursor:"pointer",display:"flex",alignItems:"center",gap:6,color:"#991b1b"}},
+            React.createElement("i",{className:"ti ti-download",style:{fontSize:13},["aria-hidden"]:"true"}),
+            "Download invalid rows CSV"
+          )
+        ),
+
+        React.createElement("button",{onClick:()=>{setStage("upload");setParsed(null);setResults(null);setAiText("");setFilter("all");setTab("summary");},style:{padding:"9px",borderRadius:8,border:"0.5px solid var(--color-border-secondary,#d1d5db)",background:"none",cursor:"pointer",fontSize:13,color:"var(--color-text-secondary,#666)",display:"flex",alignItems:"center",justifyContent:"center",gap:6}},
+          React.createElement("i",{className:"ti ti-refresh"}),
+          "Validate another file"
+        )
+      )
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
